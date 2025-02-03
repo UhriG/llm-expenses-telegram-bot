@@ -39,10 +39,11 @@ class Category:
     EXCHANGE = "exchange"
 
 class LLMClient:
-    def __init__(self):
+    def __init__(self, transaction_service):
         self.host = os.getenv('OLLAMA_HOST')
         self.model = os.getenv('MODEL')
         self.client = Client(host=self.host)
+        self.transaction_service = transaction_service
 
     def get_response(self, prompt: str) -> Dict[str, Any]:
         """Get structured response from LLM using JSON mode."""
@@ -51,7 +52,7 @@ class LLMClient:
                 model=self.model,
                 prompt=prompt + "\nRespond ONLY with valid JSON.",
                 system="You are a financial assistant that ONLY responds in valid JSON format.",
-                format="json",  # Changed from {'type': 'json'} to "json"
+                format="json",
                 stream=False,
                 options={
                     'temperature': 0.7,
@@ -59,92 +60,133 @@ class LLMClient:
                 }
             )
             
+            # Log the raw response
+            logger.info(f"Raw model response: {response['response']}")
+            
             # Response will be a valid JSON string
             try:
                 return json.loads(response['response'])
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON in response: {e}")
-                logger.debug(f"Raw response: {response['response']}")
+                logger.error(f"Problematic response: {response['response']}")
                 return None
             
         except Exception as e:
             logger.error(f"Error calling Ollama API: {e}")
+            logger.error(f"Full error details: {str(e)}")
             return None
 
     def get_structured_response(self, message: str) -> Dict[str, Any]:
         """Get a structured response with specific format."""
-        prompt = f"""Interpreta este mensaje financiero en español y devuelve un objeto JSON: '{message}'
+        # Get existing categories from database
+        existing_categories = self.transaction_service.db.get_all_categories()
+        categories_str = ", ".join(f'"{cat}"' for cat in existing_categories)
+        
+        # Clean up the message - replace multiple newlines with a single one
+        message = ' '.join(message.split())
+        
+        prompt = f"""Analiza el siguiente mensaje financiero y devuelve la respuesta en JSON: '{message}'
 
-Expected formats:
+Categorías existentes: [{categories_str}]
 
-For a SINGLE expense/income:
-{{
-    "type": "expense"|"income",  # Use "expense" for: "gasté", "pagué", "compré"
-                                # Use "income" for: "cobré", "ingresé", "recibí"
-    "amount": float,            # Convert numbers like "mil", "1k" to float
-    "description": string,      # Keep original description
-    "money_type": "bank"|"cash",
-    "category": string          # Map to closest category
-}}
-
-For MULTIPLE transactions, return an array:
-[{{
-    "type": "expense"|"income",
-    "amount": float,
-    "description": string,
-    "money_type": "bank"|"cash",
-    "category": string
-}}]
-
-For exchanges:
-{{
-    "type": "exchange",
-    "amount": float,           # Original amount
-    "target_amount": float,    # Final amount
-    "source_currency": string, # Original currency (USD, EUR, etc)
-    "target_currency": string, # Target currency (usually ARS)
-    "money_type": "bank"|"cash",
-    "exchange_rate": float     # target_amount / amount
-}}
-
-For queries:
+Para CONSULTAS (resumen, balance, etc) usar este formato:
 {{
     "type": "query",
-    "query_type": "summary"|"balance",  # "summary" for: "resumen", "total", "mostrame todo"
-                                       # "balance" for: "cuánto tengo", "saldo"
-    "money_type": "cash"|"bank"|"all"   # "cash" for: "efectivo", "plata"
-                                       # "bank" for: "banco", "cuenta"
-                                       # "all" for general queries
+    "query_type": "summary"|"balance",  # "summary" para "resumen", "mostrame todo" | "balance" para "cuánto tengo"
+    "money_type": "cash"|"bank"|"all"   # "cash" para efectivo, "bank" para banco, "all" para todo
 }}
 
-Categories:
-- "comida": restaurantes, delivery, cafetería, fiambrería, almuerzo, cena, comida, restaurant
-- "transporte": taxi, uber, colectivo, subte, nafta, bondi, tren, didi, remis
-- "servicios": luz, gas, agua, internet, teléfono, servicios, factura, seguro, impuestos
-- "supermercado": super, mercado, almacén, verdulería, carnicería, pescadería, panadería, pastelería, heladería
-- "entretenimiento": cine, teatro, juegos, salidas, streaming, spotify, netflix, bar
-- "salud": farmacia, médico, medicamentos, consulta, análisis
-- "otros": default when unclear
+Para TRANSACCIONES usar este formato (siempre en array):
+[
+    {{
+        "type": "expense"|"income",
+        "amount": float,
+        "description": string,
+        "money_type": "bank"|"cash",
+        "category": string,
+        "should_create_category": boolean,
+        "category_reason": string
+    }}
+]
 
-Rules:
-1. ALWAYS return valid JSON
-2. For expenses with "tarjeta"|"transferencia"|"débito"|"crédito" → Use "bank"
-3. For expenses with "efectivo"|"cash"|"plata" → Use "cash"
-4. DEFAULT to "cash" if no payment method mentioned
-5. Use ONLY the specified category values
-6. Convert ALL amounts to float
-7. For exchanges, calculate exchange_rate as target_amount/amount
-8. Return array ONLY for multiple transactions
-9. Process Spanish text and common Argentine terms
+Para CAMBIO DE DIVISAS usar este formato:
+{{
+    "type": "exchange",
+    "amount": float,
+    "target_amount": float,
+    "source_currency": string,
+    "target_currency": string,
+    "money_type": "bank"|"cash",
+    "exchange_rate": float  # Calculado como target_amount/amount
+}}
 
-DO NOT include any text outside the JSON structure.
+REGLAS:
+1. Si el mensaje es una consulta como "resumen", "balance", "cuánto tengo", "mostrame" → Usar formato de CONSULTAS
+2. Si el mensaje es sobre gastos/ingresos → Usar formato de TRANSACCIONES
+3. Si el mensaje es sobre cambio de divisas → Usar formato de CAMBIO
+4. Para pagos de tarjeta de crédito o servicios financieros → category: "financiero"
+5. Para transferencias o tarjeta → money_type: "bank"
+6. Para efectivo → money_type: "cash"
+7. Convertir TODOS los montos a números (sin el símbolo $)
+8. NO incluir texto fuera de la estructura JSON
+9. NO usar caracteres especiales en las descripciones
+
+Ejemplos:
+1. "Dame un resumen" →
+{{
+    "type": "query",
+    "query_type": "summary",
+    "money_type": "all"
+}}
+
+2. "Gasté $100 en comida" →
+[{{
+    "type": "expense",
+    "amount": 100.0,
+    "description": "Comida",
+    "money_type": "cash",
+    "category": "comida",
+    "should_create_category": false,
+    "category_reason": ""
+}}]
+
+3. "Cambié 100 USD a 90000 pesos" →
+{{
+    "type": "exchange",
+    "amount": 100.0,
+    "target_amount": 90000.0,
+    "source_currency": "USD",
+    "target_currency": "ARS",
+    "money_type": "cash",
+    "exchange_rate": 900.0
+}}
+
+Palabras clave:
+- Consultas: "resumen", "balance", "cuánto tengo", "mostrar", "dame"
+- Gastos: "gasté", "pagué", "compré", "tarjeta"
+- Ingresos: "cobré", "recibí", "ingresé", "deposité"
+- Cambios: "cambié", "convertí", "pasé de"
 """
-        return self.get_response(prompt)
+
+        try:
+            response = self.get_response(prompt)
+            if not response:
+                return None
+            
+            # If response is a transaction dict, wrap it in a list
+            if isinstance(response, dict):
+                if response.get('type') in ['expense', 'income']:
+                    response = [response]
+            
+            return response
+        except Exception as e:
+            logger.error(f"Error processing response: {e}")
+            return None
 
 class BotHandler:
     def __init__(self):
         self.transaction_service = TransactionService()
-        self.llm = LLMClient()
+        self.llm = LLMClient(self.transaction_service)
         logger.info("BotHandler initialized")
 
     @asynccontextmanager
@@ -168,18 +210,33 @@ Simplemente contame sobre tus gastos o ingresos en lenguaje natural:
 - "Cuánto tengo en efectivo?"
 - "Dame un resumen"
 
-Comandos administrativos:
+Comandos disponibles:
+/listar - Ver últimas 10 transacciones 📋
+/listar all - Ver todas las transacciones 📋
+/listar categoria - Ver transacciones de una categoría 📋
+/borrar ID - Borrar una transacción específica 🗑
 /clear - Borrar todas las transacciones ⚠️
+/renombrar vieja nueva - Renombrar una categoría 📝
 """
         await update.message.reply_text(welcome_text)
 
     async def clear_database(self, update: Update, context):
         """Initiate database clearing process."""
         group_id = update.message.chat.id
-        logger.info(f"User requested to clear transactions for group {group_id}")
+        
+        # Get current transaction count
+        transactions = self.transaction_service.db.get_latest_transactions(group_id, limit=None)
+        count = len(transactions)
+        
+        logger.info(f"User requested to clear {count} transactions for group {group_id}")
+        
         await update.message.reply_text(
-            "⚠️ ¿Estás seguro de que querés borrar TODAS las transacciones?\n"
-            "Esta acción no se puede deshacer.\n"
+            f"⚠️ ¿Estás seguro de que querés borrar TODAS las transacciones ({count} en total)?\n"
+            "Esta acción:\n"
+            "- Borrará todas las transacciones\n"
+            "- Reiniciará los IDs desde 1\n"
+            "- Mantendrá las categorías existentes\n"
+            "- No se puede deshacer\n\n"
             "Escribí /confirmar para proceder."
         )
         context.user_data['clear_pending'] = True
@@ -190,7 +247,10 @@ Comandos administrativos:
             group_id = update.message.chat.id
             self.transaction_service.db.clear_transactions(group_id)
             logger.info(f"Cleared transactions for group {group_id}")
-            await update.message.reply_text("✅ Se borraron todas las transacciones.")
+            await update.message.reply_text(
+                "✅ Se borraron todas las transacciones.\n"
+                "Los próximos registros comenzarán desde el ID 1."
+            )
             context.user_data['clear_pending'] = False
         else:
             await update.message.reply_text("No hay ninguna operación de borrado pendiente.")
@@ -374,14 +434,18 @@ Comandos administrativos:
         """Process an expense or income transaction."""
         is_expense = data['type'] == TransactionType.EXPENSE
         
-        # Clean up description - capitalize first letter and handle Spanish characters
+        # Clean up description
         description = data.get('description', '').strip()
         if description:
             description = description[0].upper() + description[1:].lower()
-            # Handle Spanish characters
-            description = description.replace('fiambreria', 'fiambrería')
         
-        category_id = self._get_category_id(data.get('category', Category.COMIDA))
+        # Handle category creation if needed
+        if data.get('should_create_category', False):
+            category_name = data['category']
+            category_reason = data.get('category_reason', 'New category needed')
+            logger.info(f"Creating new category '{category_name}'. Reason: {category_reason}")
+        
+        category_id = self._get_category_id(data.get('category'))
         money_type_id = self._get_money_type_id(data.get('money_type', MoneyType.CASH))
         
         transaction = Transaction(
@@ -421,16 +485,134 @@ Comandos administrativos:
             return self._get_money_type_id(MoneyType.CASH)
         return self.transaction_service.db.get_or_create_money_type(money_type)
 
+    async def list_transactions(self, update: Update, context):
+        """List recent transactions for deletion."""
+        group_id = update.message.chat.id
+        show_all = False
+        category = None
+        
+        # Parse arguments
+        if context.args:
+            if context.args[0].lower() == "all":
+                show_all = True
+            else:
+                # Check if it's a valid category
+                category = context.args[0].lower()
+                if category not in self.transaction_service.db.get_all_categories():
+                    categories = ", ".join(self.transaction_service.db.get_all_categories())
+                    await update.message.reply_text(
+                        f"❌ Categoría no válida. Las categorías disponibles son:\n{categories}"
+                    )
+                    return
+        
+        transactions = self.transaction_service.db.get_latest_transactions(
+            group_id, 
+            limit=None if show_all else 10,
+            category=category
+        )
+        
+        if not transactions:
+            msg = "No hay transacciones"
+            if category:
+                msg += f" en la categoría '{category}'"
+            msg += " para mostrar."
+            await update.message.reply_text(msg)
+            return
+        
+        # Format the transaction list
+        message = "🗑 Para borrar una transacción, usá /borrar seguido del ID\n\n"
+        if category:
+            message = f"📊 Mostrando transacciones de la categoría '{category}'\n\n"
+        
+        message += "ID | Fecha | Tipo | Monto | Categoría | Descripción\n"
+        message += "-" * 50 + "\n"
+        
+        for tx in transactions:
+            tx_id, tx_type, amount, description, tx_category, timestamp = tx
+            # Format timestamp to local date
+            date = timestamp.split()[0]  # Get just the date part
+            # Format amount with sign
+            amount_str = f"${abs(amount):.2f}"
+            if tx_type == "expense":
+                amount_str = f"-{amount_str}"
+            elif tx_type == "income":
+                amount_str = f"+{amount_str}"
+            
+            message += f"{tx_id} | {date} | {tx_type} | {amount_str} | {tx_category} | {description}\n"
+        
+        message += "\nEjemplos:\n"
+        message += "/borrar 123 - Borra una transacción\n"
+        message += "/listar all - Muestra todas las transacciones\n"
+        message += "/listar comida - Muestra solo transacciones de comida"
+        
+        await update.message.reply_text(message)
+
+    async def delete_transaction(self, update: Update, context):
+        """Delete a specific transaction by ID."""
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Tenés que especificar el ID de la transacción a borrar.\n"
+                "Usá /listar para ver los IDs disponibles."
+            )
+            return
+        
+        try:
+            transaction_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "❌ El ID debe ser un número.\n"
+                "Usá /listar para ver los IDs disponibles."
+            )
+            return
+        
+        group_id = update.message.chat.id
+        if self.transaction_service.db.delete_transaction(transaction_id, group_id):
+            await update.message.reply_text(f"✅ Transacción {transaction_id} borrada correctamente.")
+            logger.info(f"Deleted transaction {transaction_id} for group {group_id}")
+        else:
+            await update.message.reply_text(
+                "❌ No se encontró la transacción o no tenés permiso para borrarla."
+            )
+
+    async def rename_category(self, update: Update, context):
+        """Rename a category."""
+        if len(context.args) < 2:
+            # Show current categories and usage
+            categories = self.transaction_service.db.get_all_categories()
+            categories_list = "\n".join(f"- {cat}" for cat in categories)
+            
+            await update.message.reply_text(
+                "❌ Tenés que especificar la categoría original y el nuevo nombre.\n\n"
+                "Uso: /renombrar categoria_original nuevo_nombre\n\n"
+                "Categorías actuales:\n"
+                f"{categories_list}\n\n"
+                "Ejemplo: /renombrar comida alimentos"
+            )
+            return
+        
+        old_name = context.args[0].lower()
+        new_name = context.args[1].lower()
+        
+        success, message = self.transaction_service.db.rename_category(old_name, new_name)
+        if success:
+            logger.info(f"Category renamed from '{old_name}' to '{new_name}'")
+            await update.message.reply_text(f"✅ {message}")
+        else:
+            await update.message.reply_text(f"❌ {message}")
+
 def main():
     bot_token = os.getenv('BOT_TOKEN')
     application = Application.builder().token(bot_token).build()
     
     bot_handler = BotHandler()
     
-    # Add command handlers for sensitive operations
+    # Add command handlers
     application.add_handler(CommandHandler("start", bot_handler.start))
     application.add_handler(CommandHandler("clear", bot_handler.clear_database))
     application.add_handler(CommandHandler("confirmar", bot_handler.confirm_clear))
+    application.add_handler(CommandHandler("listar", bot_handler.list_transactions))
+    application.add_handler(CommandHandler("borrar", bot_handler.delete_transaction))
+    application.add_handler(CommandHandler("renombrar", bot_handler.rename_category))
     
     # Handle all other messages through natural language
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.handle_message))
