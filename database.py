@@ -1,10 +1,11 @@
 import sqlite3
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
+from utils.logger import logger
 
 class DatabaseHandler:
     def __init__(self, db_name='expenses.db'):
-        self.conn = sqlite3.connect(db_name)
+        self.conn = sqlite3.connect(db_name, timeout=20)
         self.cursor = self.conn.cursor()
         self._create_tables()
 
@@ -31,6 +32,7 @@ class DatabaseHandler:
                 description TEXT,
                 category_id INTEGER,
                 money_type_id INTEGER,
+                currency TEXT NOT NULL DEFAULT 'ARS',
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (category_id) REFERENCES categories(id),
                 FOREIGN KEY (money_type_id) REFERENCES money_types(id)
@@ -43,25 +45,48 @@ class DatabaseHandler:
                 source_currency TEXT NOT NULL,
                 target_currency TEXT NOT NULL,
                 exchange_rate REAL NOT NULL,
+                source_amount REAL NOT NULL,
+                target_amount REAL NOT NULL,
                 FOREIGN KEY (transaction_id) REFERENCES transactions(id)
             )
         ''')
         self.conn.commit()
 
-    def add_transaction(self, user_id, group_id, transaction_type, amount, description=None, category_id=None, money_type_id=None):
+    def add_transaction(self, user_id, group_id, transaction_type, amount, description=None, category_id=None, money_type_id=None, currency='ARS'):
         self.cursor.execute('''
-            INSERT INTO transactions (user_id, group_id, type, amount, description, category_id, money_type_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, group_id, transaction_type, amount, description, category_id, money_type_id))
+            INSERT INTO transactions (
+                user_id, group_id, type, amount, description, 
+                category_id, money_type_id, currency
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            user_id, group_id, transaction_type, amount, description, 
+            category_id, money_type_id, currency
+        ))
         self.conn.commit()
         return self.cursor.lastrowid
 
-    def add_exchange_transaction(self, transaction_id, source_currency, target_currency, exchange_rate):
-        self.cursor.execute('''
-            INSERT INTO exchange_transactions (transaction_id, source_currency, target_currency, exchange_rate)
-            VALUES (?, ?, ?, ?)
-        ''', (transaction_id, source_currency, target_currency, exchange_rate))
-        self.conn.commit()
+    def add_exchange_transaction(self, transaction_id, source_currency, target_currency, exchange_rate, source_amount, target_amount):
+        try:
+            self.cursor.execute('BEGIN TRANSACTION')
+            
+            self.cursor.execute('''
+                INSERT INTO exchange_transactions (
+                    transaction_id, source_currency, target_currency, 
+                    exchange_rate, source_amount, target_amount
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                transaction_id, source_currency, target_currency, 
+                exchange_rate, source_amount, target_amount
+            ))
+            
+            self.cursor.execute('COMMIT')
+            logger.info(f"Added exchange transaction record: {source_amount} {source_currency} → {target_amount} {target_currency}")
+        except Exception as e:
+            self.cursor.execute('ROLLBACK')
+            logger.error(f"Error adding exchange transaction: {e}")
+            raise
 
     def get_balance(self, group_id):
         self.cursor.execute('''
@@ -106,26 +131,37 @@ class DatabaseHandler:
     def clear_transactions(self, group_id: int) -> None:
         """Clear all transactions and reset IDs."""
         try:
-            # First delete from exchange_transactions (child table)
-            self.cursor.execute('''
-                DELETE FROM exchange_transactions 
-                WHERE transaction_id IN (
-                    SELECT id FROM transactions WHERE group_id = ?
-                )
-            ''', (group_id,))
+            # Start a transaction
+            self.cursor.execute('BEGIN TRANSACTION')
             
-            # Then delete from transactions
+            # Get all transaction IDs for this group
+            self.cursor.execute('''
+                SELECT id FROM transactions WHERE group_id = ?
+            ''', (group_id,))
+            transaction_ids = [row[0] for row in self.cursor.fetchall()]
+            
+            if transaction_ids:
+                # Delete exchange transactions using IN clause
+                self.cursor.execute('''
+                    DELETE FROM exchange_transactions 
+                    WHERE transaction_id IN ({})
+                '''.format(','.join('?' * len(transaction_ids))), transaction_ids)
+            
+            # Delete transactions
             self.cursor.execute('DELETE FROM transactions WHERE group_id = ?', (group_id,))
             
-            # Reset the autoincrement counters
-            self.cursor.execute('DELETE FROM sqlite_sequence WHERE name IN (?, ?)', 
-                ('transactions', 'exchange_transactions'))
+            # Reset sequences
+            self.cursor.execute('UPDATE sqlite_sequence SET seq = 0 WHERE name = "transactions"')
+            self.cursor.execute('UPDATE sqlite_sequence SET seq = 0 WHERE name = "exchange_transactions"')
             
-            self.conn.commit()
-            logger.info(f"Cleared all transactions for group {group_id} and reset IDs")
+            # Commit transaction
+            self.cursor.execute('COMMIT')
+            logger.info(f"Cleared {len(transaction_ids)} transactions and their exchange records for group {group_id}")
+            
         except Exception as e:
+            self.cursor.execute('ROLLBACK')
             logger.error(f"Error clearing transactions: {e}")
-            self.conn.rollback()
+            raise
 
     def close(self):
         self.conn.close()
@@ -298,3 +334,67 @@ class DatabaseHandler:
         except Exception as e:
             logger.error(f"Error renaming category: {e}")
             return False, "Error al renombrar la categoría" 
+
+    def get_balance_by_money_type_and_currency(self, group_id: int, money_type_id: int, currency: str) -> float:
+        """Get balance for a specific money type and currency."""
+        try:
+            if currency == 'USD':
+                # Get all USD transactions (both regular and exchanges)
+                self.cursor.execute('''
+                    SELECT id, type, amount, description 
+                    FROM transactions 
+                    WHERE group_id = ? AND currency = 'USD'
+                    ORDER BY timestamp
+                ''', (group_id,))
+                transactions = self.cursor.fetchall()
+                logger.info("=== USD Transactions ===")
+                for tx in transactions:
+                    logger.info(f"ID: {tx[0]}, Type: {tx[1]}, Amount: {tx[2]}, Desc: {tx[3]}")
+
+                # Calculate USD balance:
+                # 1. Get all regular USD transactions (incomes and expenses)
+                self.cursor.execute('''
+                    SELECT COALESCE(SUM(amount), 0)
+                    FROM transactions
+                    WHERE group_id = ? 
+                    AND currency = 'USD'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM exchange_transactions e 
+                        WHERE e.transaction_id = transactions.id
+                    )
+                ''', (group_id,))
+                regular_balance = self.cursor.fetchone()[0] or 0.0
+                logger.info(f"Regular USD Balance: {regular_balance}")
+
+                # 2. Get all USD amounts that were exchanged to ARS
+                self.cursor.execute('''
+                    SELECT COALESCE(SUM(e.source_amount), 0)
+                    FROM exchange_transactions e
+                    JOIN transactions t ON e.transaction_id = t.id
+                    WHERE t.group_id = ? 
+                    AND e.source_currency = 'USD'
+                ''', (group_id,))
+                exchanged_amount = self.cursor.fetchone()[0] or 0.0
+                logger.info(f"USD Exchanged Amount: {exchanged_amount}")
+
+                # Final balance is regular transactions minus exchanged amounts
+                final_balance = regular_balance - exchanged_amount
+                logger.info(f"Final USD Balance: {final_balance}")
+
+                return final_balance
+            else:
+                # For ARS, calculate balance properly
+                self.cursor.execute('''
+                    SELECT COALESCE(SUM(amount), 0)  -- amount is already signed (-ve for expenses)
+                    FROM transactions
+                    WHERE group_id = ? 
+                    AND money_type_id = ? 
+                    AND currency = ?
+                ''', (group_id, money_type_id, currency))
+                balance = self.cursor.fetchone()[0] or 0.0
+                logger.info(f"ARS Balance for money_type {money_type_id}: {balance}")
+                return balance
+
+        except Exception as e:
+            logger.error(f"Error getting balance by money type and currency: {e}")
+            return 0.0 

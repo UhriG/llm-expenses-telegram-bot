@@ -13,7 +13,8 @@ class TransactionService:
             transaction.amount,
             transaction.description,
             transaction.category_id,
-            transaction.money_type_id
+            transaction.money_type_id,
+            transaction.currency
         )
         return transaction_id
 
@@ -22,5 +23,7 @@ class TransactionService:
             exchange_transaction.transaction_id,
             exchange_transaction.source_currency,
             exchange_transaction.target_currency,
-            exchange_transaction.exchange_rate
+            exchange_transaction.exchange_rate,
+            exchange_transaction.source_amount,
+            exchange_transaction.target_amount
         ) 

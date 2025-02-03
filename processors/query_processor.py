@@ -23,77 +23,50 @@ class QueryProcessor:
         'query_type' and 'money_type' fields in query_data.
         """
         try:
-            # For summary queries, force money_type to be all so we can combine balances.
+            # Get balances by currency
+            ars_balances = self._get_balances_by_currency(group_id, 'ARS')
+            usd_balance = self.transaction_service.db.get_balance_by_money_type_and_currency(group_id, None, 'USD')
+
             if query_data.get('query_type') == 'summary':
-                query_data['money_type'] = 'all'
-
-            if query_data.get('money_type') == 'cash':
-                balance = self.transaction_service.db.get_balance_by_money_type(
-                    group_id, self.get_money_type_id("cash")
+                # Create summary text that lists balances by currency
+                summary = (
+                    "📊 Resumen de tus finanzas:\n\n"
+                    "💵 Efectivo ARS: ${:.2f}\n"
+                    "🏦 Banco ARS: ${:.2f}\n"
+                    "💰 Total ARS: ${:.2f}\n\n"
+                    "💰 Total USD: ${:.2f}\n"
+                ).format(
+                    ars_balances['cash'],
+                    ars_balances['bank'],
+                    ars_balances['total'],
+                    usd_balance
                 )
-                await update.message.reply_text(f"💵 Tu saldo en efectivo es: ${balance:.2f}")
-            elif query_data.get('money_type') == 'bank':
-                balance = self.transaction_service.db.get_balance_by_money_type(
-                    group_id, self.get_money_type_id("bank")
+                await update.message.reply_text(summary)
+            else:
+                # Show simple balance
+                await update.message.reply_text(
+                    f"Tus saldos:\n"
+                    f"💵 Efectivo ARS: ${ars_balances['cash']:.2f}\n"
+                    f"🏦 Banco ARS: ${ars_balances['bank']:.2f}\n"
+                    f"💰 Total ARS: ${ars_balances['total']:.2f}\n\n"
+                    f"💰 Total USD: ${usd_balance:.2f}"
                 )
-                await update.message.reply_text(f"🏦 Tu saldo en banco es: ${balance:.2f}")
-            else:  # money_type "all"
-                cash_balance = self.transaction_service.db.get_balance_by_money_type(
-                    group_id, self.get_money_type_id("cash")
-                )
-                bank_balance = self.transaction_service.db.get_balance_by_money_type(
-                    group_id, self.get_money_type_id("bank")
-                )
-                total_balance = cash_balance + bank_balance
-
-                if query_data.get('query_type') == 'summary':
-                    expenses = self.transaction_service.db.get_expenses_summary(group_id)
-
-                    plt.figure(figsize=(10, 8))
-                    labels = []
-                    values = []
-                    for category, amount in expenses:
-                        if amount < 0:  # Only include expenses (negative amounts)
-                            labels.append(category)
-                            values.append(abs(amount))
-
-                    if values:  # Only create chart if there are expenses
-                        plt.pie(values, labels=labels, autopct='%1.1f%%')
-                        plt.title('Distribución de Gastos por Categoría')
-
-                        # Save plot to bytes buffer
-                        buf = io.BytesIO()
-                        plt.savefig(buf, format='png', bbox_inches='tight')
-                        buf.seek(0)
-                        plt.close()
-
-                        # Create summary text that lists balances and expense details
-                        summary = (
-                            f"📊 Resumen de tus finanzas:\n\n"
-                            f"💵 Efectivo: ${cash_balance:.2f}\n"
-                            f"🏦 Banco: ${bank_balance:.2f}\n"
-                            f"💰 Total: ${total_balance:.2f}\n\n"
-                            f"📈 Detalle por categoría:\n"
-                        )
-                        for category, amount in expenses:
-                            summary += f"- {category}: ${amount:.2f}\n"
-
-                        await update.message.reply_text(summary)
-                        await update.message.reply_photo(
-                            photo=buf,
-                            caption="Distribución de tus gastos 📊"
-                        )
-                    else:
-                        await update.message.reply_text("No hay gastos registrados para mostrar en el gráfico.")
-                else:
-                    await update.message.reply_text(
-                        f"Tus saldos:\n"
-                        f"💵 Efectivo: ${cash_balance:.2f}\n"
-                        f"🏦 Banco: ${bank_balance:.2f}\n"
-                        f"💰 Total: ${total_balance:.2f}"
-                    )
         except Exception as e:
             logger.error(f"Error handling query: {e}")
             await update.message.reply_text(
                 "Perdón, hubo un error procesando tu consulta. ¿Podés intentarlo de nuevo?"
-            ) 
+            )
+
+    def _get_balances_by_currency(self, group_id: int, currency: str) -> dict:
+        """Get balances for ARS currency."""
+        cash_balance = self.transaction_service.db.get_balance_by_money_type_and_currency(
+            group_id, self.get_money_type_id("cash"), currency
+        )
+        bank_balance = self.transaction_service.db.get_balance_by_money_type_and_currency(
+            group_id, self.get_money_type_id("bank"), currency
+        )
+        return {
+            'cash': cash_balance,
+            'bank': bank_balance,
+            'total': cash_balance + bank_balance
+        } 

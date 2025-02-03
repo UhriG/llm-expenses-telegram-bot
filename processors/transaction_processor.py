@@ -16,30 +16,50 @@ class TransactionProcessor:
             self._process_regular_transaction(user_id, group_id, transaction_data)
 
     def _process_exchange_transaction(self, user_id: int, group_id: int, data: dict) -> None:
-        # Calculate exchange rate if not provided
-        if 'exchange_rate' not in data:
-            data['exchange_rate'] = data['target_amount'] / data['amount']
+        try:
+            # Use 'amount' as the source amount for consistency with LLM response
+            source_amount = data['amount']
+            target_amount = data['target_amount']
+            
+            # Calculate exchange rate properly and round to 2 decimals
+            data['exchange_rate'] = round(target_amount / source_amount, 2)  # Added rounding
+            logger.info(f"Calculated exchange rate: {data['exchange_rate']}")
 
-        transaction = Transaction(
-            user_id=user_id,
-            group_id=group_id,
-            transaction_type="income",  # Using "income" for exchange transactions
-            amount=data['target_amount'],
-            description=self._format_exchange_description(data),
-            category_id=self._get_category_id("exchange"),
-            money_type_id=self._get_money_type_id(data.get('money_type', "cash"))
-        )
-        transaction_id = self.transaction_service.add_transaction(transaction)
-        exchange_transaction = ExchangeTransaction(
-            transaction_id=transaction_id,
-            source_currency=data['source_currency'],
-            target_currency=data['target_currency'],
-            exchange_rate=data['exchange_rate']
-        )
-        self.transaction_service.add_exchange_transaction(exchange_transaction)
+            logger.info(f"Processing exchange: {source_amount} {data['source_currency']} → {target_amount} {data['target_currency']}")
+
+            # Create a single transaction record for the target currency
+            transaction = Transaction(
+                user_id=user_id,
+                group_id=group_id,
+                transaction_type="income",  # Always income since we're receiving the target currency
+                amount=target_amount,
+                description=f"Exchange: {source_amount} {data['source_currency']} → {target_amount} {data['target_currency']}",
+                category_id=self._get_category_id("exchange"),
+                money_type_id=self._get_money_type_id(data.get('money_type', "cash")),
+                currency=data['target_currency']
+            )
+            transaction_id = self.transaction_service.add_transaction(transaction)
+            logger.info(f"Created exchange transaction (ID: {transaction_id}) for {target_amount} {data['target_currency']}")
+
+            # Record the exchange details
+            exchange_transaction = ExchangeTransaction(
+                transaction_id=transaction_id,
+                source_currency=data['source_currency'],
+                target_currency=data['target_currency'],
+                exchange_rate=data['exchange_rate'],
+                source_amount=source_amount,
+                target_amount=target_amount
+            )
+            self.transaction_service.add_exchange_transaction(exchange_transaction)
+            logger.info(f"Created exchange record linking transaction {transaction_id}")
+
+        except Exception as e:
+            logger.error(f"Error processing exchange transaction: {e}")
+            raise
 
     def _process_regular_transaction(self, user_id: int, group_id: int, data: dict) -> None:
         is_expense = data['type'] == "expense"
+        currency = data.get('currency', 'ARS')  # Default to ARS if not specified
 
         # Clean up description
         description = data.get('description', '').strip()
@@ -61,7 +81,8 @@ class TransactionProcessor:
             amount=data['amount'] * (-1 if is_expense else 1),
             description=description,
             category_id=category_id,
-            money_type_id=money_type_id
+            money_type_id=money_type_id,
+            currency=currency
         )
         self.transaction_service.add_transaction(transaction)
 
