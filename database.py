@@ -398,3 +398,18 @@ class DatabaseHandler:
         except Exception as e:
             logger.error(f"Error getting balance by money type and currency: {e}")
             return 0.0 
+
+    def get_expenses_by_category(self, group_id: int, currency: str) -> List[Tuple[str, float]]:
+        """Get total expenses by category for a specific currency."""
+        self.cursor.execute('''
+            SELECT c.name, ABS(SUM(t.amount)) as total
+            FROM transactions t
+            JOIN categories c ON t.category_id = c.id
+            WHERE t.group_id = ? 
+            AND t.currency = ?
+            AND t.type = 'expense'
+            GROUP BY c.name
+            HAVING total > 0
+            ORDER BY total DESC
+        ''', (group_id, currency))
+        return self.cursor.fetchall() 
