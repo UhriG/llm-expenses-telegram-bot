@@ -1,3 +1,5 @@
 python-telegram-bot
 requests
-python-dotenv 
+python-dotenv
+ollama
+matplotlib 

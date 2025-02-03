@@ -1,5 +1,64 @@
-# Ignore environment variables
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables
 .env
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Ollama models and cache
+models/
+.ollama/
+
+# Matplotlib
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Documentation files
+*.md
+*.txt
+!README.md
+!requirements.txt
 
 # Ignore Python cache and virtual environment
 __pycache__/
